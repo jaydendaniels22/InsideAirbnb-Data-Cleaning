@@ -107,6 +107,10 @@ def bathrooms_from_text(text):
 def pct(number, total):
     return round(number / total * 100, 1)
 
+def yes_no(condition):
+    #True -> "Yes", False -> "No"
+    return np.where(condition, "Yes", "No")
+
 
 # Data quality checks. The exact same checks run on the raw and on the clean data,
 # so that the before/after table is a fair comparison.
@@ -128,7 +132,7 @@ def listings_checks(df):
     checks["Names / host names with extra spaces"] = int((messy_name | messy_host).sum())
     checks["host_location spelled 'The Netherlands'"] = int(df["host_location"].str.contains("The Netherlands", na=False).sum())
     if "flag_price_outlier" in df.columns:
-        checks["Rows flagged as extreme price"] = int(df["flag_price_outlier"].sum())
+        checks["Rows flagged as extreme price"] = int((df["flag_price_outlier"] == "Yes").sum())
     else:
         checks["Rows flagged as extreme price"] = 0
     return checks
@@ -154,9 +158,10 @@ def reviews_checks(df, listing_ids):
         df.duplicated(["listing_id", "reviewer_id", "date", "comments"]).sum())
     checks["Rows whose review id appears on more than one listing"] = int(df[id_col].duplicated(keep=False).sum())
     if "is_review_copy" in df.columns:
-        checks["Rows flagged as an extra copy of a review (is_review_copy = 1)"] = int(df["is_review_copy"].sum())
+        checks["Rows flagged as an extra copy of a review (is_review_copy = Yes)"] = int(
+            (df["is_review_copy"] == "Yes").sum())
     else:
-        checks["Rows flagged as an extra copy of a review (is_review_copy = 1)"] = 0
+        checks["Rows flagged as an extra copy of a review (is_review_copy = Yes)"] = 0
     checks["Comments containing HTML tags"] = int(df["comments"].str.contains(HAS_TAG_PATTERN, na=False).sum())
     checks["Comments with leading/trailing/double spaces"] = int(df["comments"].str.contains(r"^\s|\s$|\s\s", na=False).sum())
     checks["Comments that are only '.' or '-'"] = int(df["comments"].str.strip().isin([".", "-", "..", "..."]).sum())
@@ -186,10 +191,11 @@ def clean_calendar(df, listing_ids):
     df = df[df["listing_id"].isin(listing_ids)]
     add_log(name, "Calendar rows with a listing_id missing from listings.csv", "Checked. Would drop them (none found)", orphans)
 
-    # 4. available is the text 't' / 'f'
+    # 4. available is the text 'Yes' or 'No'.
     rows = int(df["available"].isin(["t", "f"]).sum())
-    df["available"] = df["available"].map({"t": 1, "f": 0}).astype(int)
-    add_log(name, "`available` stored as text 't'/'f'", "Converted to 1 (available) / 0 (not available) so it can be summed and averaged", rows)
+    df["available"] = df["available"].map({"t": "Yes", "f": "No"})
+    add_log(name, "`available` stored as text 't'/'f' (unclear to a reader)",
+    "Converted to 'Yes' (available) / 'No' (not available) so the column is readable without a code book", rows)
 
     # 5. maximum_nights = 2,147,483,647 is a "no limit" placeholder, not a real number
     rows = int((df["maximum_nights"] > MAX_NIGHTS_LIMIT).sum())
@@ -198,9 +204,10 @@ def clean_calendar(df, listing_ids):
     add_log(name, "`maximum_nights` = 2,147,483,647 (a 'no limit' placeholder; it wrecks averages)", "Set to NULL", rows)
 
     # Notes: things I found but did not change
-    n_not_available = int((df["available"] == 0).sum())
-    add_log(name, "`available` = 0 mixes 'booked by a guest' and 'blocked by the host'", "Not fixable with this data. Do NOT treat 0 as 'occupied' (it would overstate occupancy). Documented in README", n_not_available)
-    add_log(name, "calendar.csv has no price column in this scrape", "Cannot build price-by-date analysis. Use listings.price (one price per listing). Documented in README", len(df))
+    n_not_available = int((df["available"] == "No").sum())
+    add_log(name, "`available` = 'No' mixes 'booked by a guest' and 'blocked by the host'",
+            "Not fixable with this data. Do NOT treat 'No' as 'occupied' (it would overstate occupancy). Documented in README",
+            n_not_available)
 
     return df.reset_index(drop=True)
 
@@ -241,12 +248,16 @@ def clean_reviews(df, listing_ids):
     add_log(name, "Same review saved twice (same listing, reviewer, date and text, different review id)", "Dropped the repeats, kept the first", n_dups)
 
     # 5. The same review id on several listings
-    on_many = df["review_id"].duplicated(keep=False)                 # every row of a repeated review
-    df["is_review_copy"] = df["review_id"].duplicated(keep="first").astype(int)   # only the extra copies
+    on_many = df["review_id"].duplicated(keep=False)  # every row of a repeated review
+    is_copy = df["review_id"].duplicated(keep="first")  # only the extra copies
+    df["is_review_copy"] = yes_no(is_copy)
     n_ids = int(df.loc[on_many, "review_id"].nunique())
     n_rows = int(on_many.sum())
-    n_copies = int(df["is_review_copy"].sum())
-    add_log(name, f"{n_ids:,} review ids appear on more than one listing ({n_rows:,} rows in total). It is always listings of the SAME host, so the host re-listed the property and the reviews were carried over", "KEPT all rows, because each listing really shows that review and the counts match listings.number_of_reviews. Added `is_review_copy` = 1 on the extra copies, so `WHERE is_review_copy = 0` gives exactly one row per review for review-level analysis (sentiment, reviewer counts, reviews per year)", n_copies)
+    n_copies = int(is_copy.sum())
+    add_log(name,
+            f"{n_ids:,} review ids appear on more than one listing ({n_rows:,} rows in total). It is always listings of the SAME host, so the host re-listed the property and the reviews were carried over",
+            "KEPT all rows, because each listing really shows that review and the counts match listings.number_of_reviews. Added `is_review_copy` = 'Yes' on the extra copies, so `WHERE is_review_copy = 'No'` gives exactly one row per review for review-level analysis (sentiment, reviewer counts, reviews per year)",
+            n_copies)
 
     # 6. Comments that are just a dot or a dash
     placeholder = df["comments"].isin([".", "-", "..", "..."])
@@ -297,9 +308,13 @@ def clean_listings(df, calendar_days_available):
     add_log(name, f"`price` is missing for {pct(n_no_price, len(df))}% of listings. {n_no_price_unavailable:,} of them have availability_365 = 0, so the price is only shown for listings that can be booked", "Left as NULL, NOT filled in with an average. Price analysis only describes bookable listings. `estimated_revenue_l365d` is missing for the same rows", n_no_price)
 
     # 7. Extreme prices
-    df["flag_price_outlier"] = (df["price"] > PRICE_OUTLIER_LIMIT).astype(int)
-    n = int(df["flag_price_outlier"].sum())
-    add_log(name, f"Extreme prices: {n} listings above EUR {PRICE_OUTLIER_LIMIT:,} a night, up to EUR 11,681 (for 4 guests). Most have 0-1 reviews", "Kept the row, added `flag_price_outlier` = 1. I cannot prove they are errors, so analysts can filter them", n)
+    is_outlier = df["price"] > PRICE_OUTLIER_LIMIT
+    df["flag_price_outlier"] = yes_no(is_outlier)
+    n = int(is_outlier.sum())
+    add_log(name,
+            f"Extreme prices: {n} listings above EUR {PRICE_OUTLIER_LIMIT:,} a night, up to EUR 11,681 (for 4 guests). Most have 0-1 reviews",
+            "Kept the row, added `flag_price_outlier` = 'Yes' so analysts can filter them. I cannot prove they are errors",
+            n)
 
     # 8. maximum_nights placeholder 2,147,483,647
     max_cols = [c for c in df.columns if "maximum_nights" in c]
@@ -315,9 +330,12 @@ def clean_listings(df, calendar_days_available):
 
     # 10. Long stays
     # (rows with a missing minimum_nights compare as NA, so fillna(False) makes them 0)
-    df["flag_long_stay"] = (df["minimum_nights"] >= LONG_STAY_NIGHTS).fillna(False).astype(int)
-    n = int(df["flag_long_stay"].sum())
-    add_log(name, f"Listings with a minimum stay of {LONG_STAY_NIGHTS}+ nights (up to 800). These are long-term rentals, not short-term stays", "Kept, added `flag_long_stay` = 1 so short-term analysis can exclude them", n)
+    is_long_stay = (df["minimum_nights"] >= LONG_STAY_NIGHTS).fillna(False).astype(bool)
+    df["flag_long_stay"] = yes_no(is_long_stay)
+    n = int(is_long_stay.sum())
+    add_log(name,
+            f"Listings with a minimum stay of {LONG_STAY_NIGHTS}+ nights (up to 800). These are long-term rentals, not short-term stays",
+            "Kept, added `flag_long_stay` = 'Yes' so short-term analysis can exclude them", n)
 
     # 11. Bathrooms: the numeric column is empty but bathrooms_text has the information
     n_text = int(df["bathrooms_text"].notna().sum())
@@ -326,10 +344,12 @@ def clean_listings(df, calendar_days_available):
     n_big = int((df["bathrooms"] >= 10).sum())
     add_log(name, "Implausible bathroom counts (12 baths for a 2-guest listing, 17 for a boat)", "Kept as they are, only 2 rows. Not changed because I cannot verify the true value", n_big)
 
-    # 12. t/f columns
+    # 12. Yes/No columns
     for c in TRUE_FALSE_COLUMNS:
-        df[c] = df[c].map({"t": 1, "f": 0}).astype("Int64")
-    add_log(name, "True/false columns stored as text 't'/'f': " + ", ".join(TRUE_FALSE_COLUMNS), "Converted to 1/0. `has_availability` has 127 missing values that stay NULL", f"{len(TRUE_FALSE_COLUMNS)} columns")
+        df[c] = df[c].map({"t": "Yes", "f": "No"})
+    add_log(name, "True/false columns stored as text 't'/'f': " + ", ".join(TRUE_FALSE_COLUMNS),
+            "Converted to 'Yes'/'No'. `has_availability` has 127 missing values that stay NULL",
+            f"{len(TRUE_FALSE_COLUMNS)} columns")
 
     # 13. Text columns: HTML, extra spaces, line breaks
     for c in ["name", "host_name", "description", "host_about"]:
@@ -367,18 +387,25 @@ def clean_listings(df, calendar_days_available):
     add_log(name, "Review scores, first_review, last_review and reviews_per_month are missing for listings with 0 reviews", "Kept as NULL. This is correct, not an error. Never fill with 0 (it would drag averages down)", n_no_reviews)
 
     # 18. reviews_per_month outliers
-    df["flag_reviews_per_month_outlier"] = (df["reviews_per_month"] > MAX_REVIEWS_PER_MONTH).astype(int)
-    n = int(df["flag_reviews_per_month_outlier"].sum())
-    add_log(name, f"reviews_per_month above {MAX_REVIEWS_PER_MONTH} (up to 90, i.e. 3 reviews a day)", "Kept, added `flag_reviews_per_month_outlier` = 1", n)
+    is_rpm_outlier = df["reviews_per_month"] > MAX_REVIEWS_PER_MONTH
+    df["flag_reviews_per_month_outlier"] = yes_no(is_rpm_outlier)
+    n = int(is_rpm_outlier.sum())
+    add_log(name, f"reviews_per_month above {MAX_REVIEWS_PER_MONTH} (up to 90, i.e. 3 reviews a day)",
+            "Kept, added `flag_reviews_per_month_outlier` = 'Yes'", n)
 
     # 19. Listing availability vs calendar.csv
     df["calendar_days_available"] = df["listing_id"].map(calendar_days_available).fillna(0).astype(int)
-    df["flag_availability_mismatch"] = (df["availability_365"] != df["calendar_days_available"]).astype(int)
-    n = int(df["flag_availability_mismatch"].sum())
+    mismatch = df["availability_365"] != df["calendar_days_available"]
+    df["flag_availability_mismatch"] = yes_no(mismatch)
+    n = int(mismatch.sum())
     n_more = int((df["calendar_days_available"] > df["availability_365"]).sum())
-    add_log(name, f"`availability_365` does not match the number of available days in calendar.csv (the calendar shows MORE available days in {n_more} of them)", "Kept both. Added `calendar_days_available` (counted from calendar.csv) and `flag_availability_mismatch` = 1. Pick one source and stay consistent", n)
-    n = int(((df["has_availability"] == 0) & (df["calendar_days_available"] > 0)).sum())
-    add_log(name, "`has_availability` = 0 ('f') but the calendar shows available days", "Not changed, but this is another sign the availability fields disagree. Documented in README", n)
+    add_log(name,
+            f"`availability_365` does not match the number of available days in calendar.csv (the calendar shows MORE available days in {n_more} of them)",
+            "Kept both. Added `calendar_days_available` (counted from calendar.csv) and `flag_availability_mismatch` = 'Yes'. Pick one source and stay consistent",
+            n)
+    n = int(((df["has_availability"] == "No") & (df["calendar_days_available"] > 0)).sum())
+    add_log(name, "`has_availability` = 'No' but the calendar shows available days",
+            "Not changed, but this is another sign the availability fields disagree. Documented in README", n)
 
     # Notes: found but not changed
     n_bedrooms = int(df["bedrooms"].isna().sum())
@@ -462,7 +489,7 @@ def main():
     print("Step 3: cleaning...")
     calendar = clean_calendar(calendar_raw, raw_ids)
     reviews = clean_reviews(reviews_raw, raw_ids)
-    days_available = calendar[calendar["available"] == 1].groupby("listing_id").size()
+    days_available = calendar[calendar["available"] == "Yes"].groupby("listing_id").size()
     listings = clean_listings(listings_raw, days_available)
 
     #Step 4: quality checks on the clean data
@@ -494,7 +521,7 @@ def main():
         CREATE TABLE calendar (
             listing_id      INTEGER NOT NULL,
             date            TEXT    NOT NULL,
-            available       INTEGER NOT NULL,   -- 1 = available, 0 = not available
+            available       TEXT    NOT NULL CHECK (available IN ('Yes', 'No')),   -- 1 = available, 0 = not available
             minimum_nights  INTEGER,
             maximum_nights  INTEGER,            -- NULL where the raw file had the 'no limit' placeholder
             PRIMARY KEY (listing_id, date)
